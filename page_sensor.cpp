@@ -94,9 +94,7 @@ void PageSensor::applySensorData(const AliyunSensorData &data)
         humiValue->setText(formatNumber(data.humidity) + QStringLiteral(" %"));
 
     if (data.hasSmoke) {
-        smokeValue->setText(data.smoke > 0.0
-                                ? QStringLiteral("异常")
-                                : QStringLiteral("正常"));
+        smokeValue->setText(formatNumber(data.smoke) + QStringLiteral(" ug/m³"));
     }
 
     if (data.hasFire)

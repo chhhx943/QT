@@ -45,6 +45,38 @@ QSslConfiguration aliyunSslConfiguration()
     return sslConfig;
 }
 
+QString mqttClientStateName(QMqttClient::ClientState state)
+{
+    switch(state) {
+    case QMqttClient::Disconnected:
+        return QStringLiteral("Disconnected");
+    case QMqttClient::Connecting:
+        return QStringLiteral("Connecting");
+    case QMqttClient::Connected:
+        return QStringLiteral("Connected");
+    }
+
+    return QStringLiteral("Unknown");
+}
+
+QString mqttSubscriptionStateName(QMqttSubscription::SubscriptionState state)
+{
+    switch(state) {
+    case QMqttSubscription::Unsubscribed:
+        return QStringLiteral("Unsubscribed");
+    case QMqttSubscription::SubscriptionPending:
+        return QStringLiteral("SubscriptionPending");
+    case QMqttSubscription::Subscribed:
+        return QStringLiteral("Subscribed");
+    case QMqttSubscription::UnsubscriptionPending:
+        return QStringLiteral("UnsubscriptionPending");
+    case QMqttSubscription::Error:
+        return QStringLiteral("Error");
+    }
+
+    return QStringLiteral("Unknown");
+}
+
 } // namespace
 
 AliyunMqttClient::AliyunMqttClient(QObject *parent)
@@ -62,6 +94,9 @@ AliyunMqttClient::AliyunMqttClient(QObject *parent)
     connect(m_reconnectTimer,&QTimer::timeout,this,&AliyunMqttClient::reconnectToAliyun);
 
     connect(m_client,&QMqttClient::connected,this,[this](){
+        qInfo().noquote()
+            << QStringLiteral("MQTT 已连接: host=%1，clientId=%2，开始订阅")
+                   .arg(m_client->hostname(), plainClientId());
         m_reconnectTimer->stop();
         m_manualDisconnect = false;
         subscribeConfiguredTopics();
@@ -69,10 +104,18 @@ AliyunMqttClient::AliyunMqttClient(QObject *parent)
     });
 
     connect(m_client,&QMqttClient::disconnected,this,[this](){
+        qWarning().noquote()
+            << QStringLiteral("MQTT 已断开: state=%1，error=%2")
+                   .arg(mqttClientStateName(m_client->state()),
+                        mqttErrorMessage(m_client->error()));
         emit disconnected();
         scheduleReconnect();
     });
-    connect(m_client,&QMqttClient::stateChanged,this,&AliyunMqttClient::stateChanged);
+    connect(m_client,&QMqttClient::stateChanged,this,[this](QMqttClient::ClientState state){
+        qInfo().noquote()
+            << QStringLiteral("MQTT state changed: %1").arg(mqttClientStateName(state));
+        emit stateChanged(state);
+    });
     connect(m_client,&QMqttClient::messageReceived,
             this,&AliyunMqttClient::handleMessageReceived);
 
@@ -166,6 +209,15 @@ QString AliyunMqttClient::defaultPropertySetTopic() const
         .arg(m_config.productKey,m_config.deviceName);
 }
 
+static QString aliyunRuleEnginePropertySetTopic(const QString &productKey, const QString &deviceName)
+{
+    if(productKey.isEmpty() || deviceName.isEmpty())
+        return QString();
+
+    return QStringLiteral("/%1/%2/thing/service/property/set")
+        .arg(productKey, deviceName);
+}
+
 bool AliyunMqttClient::validateConfig()
 {
     if(m_config.productKey.isEmpty()
@@ -195,18 +247,40 @@ void AliyunMqttClient::applyConnectionOptions()
 
 void AliyunMqttClient::subscribeConfiguredTopics()
 {
-    QStringList topics = m_config.subscribeTopics;
+    QStringList topics;
+    topics << defaultPropertySetTopic();
+    topics << aliyunRuleEnginePropertySetTopic(m_config.productKey, m_config.deviceName);
+    topics << m_config.subscribeTopics;
 
-    if(topics.isEmpty())
-        topics << defaultPropertySetTopic();
+    topics.removeDuplicates();
 
     for(const QString &topic:topics) {
         if(topic.isEmpty())
             continue;
 
         QMqttSubscription *subscription = m_client->subscribe(QMqttTopicFilter(topic),1);
-        if(!subscription)
+        if(subscription) {
+            qInfo().noquote() << QStringLiteral("MQTT subscribe request: %1").arg(topic);
+            connect(subscription, &QMqttSubscription::stateChanged,
+                    this, [topic, subscription](QMqttSubscription::SubscriptionState state) {
+                qInfo().noquote()
+                    << QStringLiteral("MQTT subscription state: topic=%1，state=%2，qos=%3，reasonCode=%4，reason=%5")
+                           .arg(topic,
+                                mqttSubscriptionStateName(state),
+                                QString::number(subscription->qos()),
+                                QString::number(static_cast<int>(subscription->reasonCode())),
+                                subscription->reason());
+                if(state == QMqttSubscription::Error) {
+                    qWarning().noquote()
+                        << QStringLiteral("MQTT 订阅被拒绝: topic=%1，reasonCode=%2，reason=%3")
+                               .arg(topic,
+                                    QString::number(static_cast<int>(subscription->reasonCode())),
+                                    subscription->reason());
+                }
+            });
+        } else {
             emit errorOccurred(QStringLiteral("订阅失败: %1").arg(topic));
+        }
     }
 }
 
@@ -239,6 +313,9 @@ void AliyunMqttClient::reconnectToAliyun()
 void AliyunMqttClient::handleMessageReceived(const QByteArray &message, const QMqttTopicName &topic)
 {
     const QString topicName = topic.name();
+    qInfo().noquote()
+        << QStringLiteral("MQTT received: topic=%1, payload=%2")
+               .arg(topicName, QString::fromUtf8(message));
     emit rawMessageReceived(topicName,message);
 
     QJsonParseError parseError;
@@ -344,7 +421,7 @@ QString AliyunMqttClient::mqttErrorMessage(QMqttClient::ClientError error)
     case QMqttClient::NotAuthorized:
         return QStringLiteral("认证失败或无权限");
     case QMqttClient::TransportInvalid:
-        return QStringLiteral("网络传输异常，请检查地址、端口、TLS 和网络");
+        return QStringLiteral("网络传输异常，请检查地址、端口、TLS 和网络连接");
     case QMqttClient::ProtocolViolation:
         return QStringLiteral("MQTT 协议违规");
     case QMqttClient::UnknownError:
@@ -365,8 +442,45 @@ bool AliyunMqttClient::parseSensorData(const QJsonObject &root, AliyunSensorData
 
     if(root.value(QStringLiteral("params")).isObject())
         params = root.value(QStringLiteral("params")).toObject();
+    else if(root.value(QStringLiteral("Params")).isObject())
+        params = root.value(QStringLiteral("Params")).toObject();
+    else if(root.value(QStringLiteral("params")).isString()) {
+        const QJsonDocument nestedDoc = QJsonDocument::fromJson(
+            root.value(QStringLiteral("params")).toString().toUtf8());
+        if(nestedDoc.isObject())
+            params = nestedDoc.object();
+    } else if(root.value(QStringLiteral("Params")).isString()) {
+        const QJsonDocument nestedDoc = QJsonDocument::fromJson(
+            root.value(QStringLiteral("Params")).toString().toUtf8());
+        if(nestedDoc.isObject())
+            params = nestedDoc.object();
+    }
     else
         params = root;
+
+    auto mergeAliyunItems = [](QJsonObject target, const QJsonObject &source) {
+        const QJsonValue itemsValue = source.value(QStringLiteral("items"));
+        if(!itemsValue.isObject())
+            return target;
+
+        const QJsonObject items = itemsValue.toObject();
+        for(auto it = items.begin(); it != items.end(); ++it) {
+            if(it.value().isObject()) {
+                const QJsonObject itemObject = it.value().toObject();
+                if(itemObject.contains(QStringLiteral("value")))
+                    target.insert(it.key(), itemObject.value(QStringLiteral("value")));
+                else
+                    target.insert(it.key(), it.value());
+            } else {
+                target.insert(it.key(), it.value());
+            }
+        }
+
+        return target;
+    };
+
+    params = mergeAliyunItems(params, params);
+    params = mergeAliyunItems(params, root);
 
     if(params.isEmpty())
         return false;
@@ -382,6 +496,17 @@ bool AliyunMqttClient::parseSensorData(const QJsonObject &root, AliyunSensorData
                 *value = jsonValue.toDouble();
                 matched = true;
                 return;
+            }
+
+            if(jsonValue.isString()) {
+                bool ok = false;
+                const double numericValue = jsonValue.toString().toDouble(&ok);
+                if(ok) {
+                    *hasValue = true;
+                    *value = numericValue;
+                    matched = true;
+                    return;
+                }
             }
         }
     };
@@ -402,21 +527,38 @@ bool AliyunMqttClient::parseSensorData(const QJsonObject &root, AliyunSensorData
                 matched = true;
                 return;
             }
+
+            if(jsonValue.isString()) {
+                const QString text = jsonValue.toString().trimmed().toLower();
+                if(text == QStringLiteral("true") || text == QStringLiteral("1")) {
+                    *hasValue = true;
+                    *value = true;
+                    matched = true;
+                    return;
+                }
+
+                if(text == QStringLiteral("false") || text == QStringLiteral("0")) {
+                    *hasValue = true;
+                    *value = false;
+                    matched = true;
+                    return;
+                }
+            }
         }
     };
 
-    readNumber({QStringLiteral("temperature"),QStringLiteral("temp")},
+    readNumber({QStringLiteral("temperature"),QStringLiteral("Temperature"),QStringLiteral("temp")},
                &data->hasTemperature,&data->temperature);
     readNumber({QStringLiteral("humidity"),QStringLiteral("humi"),QStringLiteral("Humidity")},
                &data->hasHumidity,&data->humidity);
-    readNumber({QStringLiteral("smoke"),QStringLiteral("smokeConcentration"),QStringLiteral("smokeconcentration")},
+    readNumber({QStringLiteral("smoke"),QStringLiteral("Smoke"),QStringLiteral("smokeConcentration"),QStringLiteral("smokeconcentration")},
                &data->hasSmoke,&data->smoke);
-    readNumber({QStringLiteral("airPressure"),QStringLiteral("airpressure"),QStringLiteral("pressure")},
+    readNumber({QStringLiteral("airPressure"),QStringLiteral("AirPressure"),QStringLiteral("airpressure"),QStringLiteral("pressure")},
                &data->hasAirPressure,&data->airPressure);
 
-    readBool({QStringLiteral("fire"),QStringLiteral("fireDetected"),QStringLiteral("flame")},
+    readBool({QStringLiteral("fire"),QStringLiteral("Fire"),QStringLiteral("fireDetected"),QStringLiteral("flame")},
              &data->hasFire,&data->fireDetected);
-    readBool({QStringLiteral("combustibleGas"),QStringLiteral("combustible_gas"),QStringLiteral("gas")},
+    readBool({QStringLiteral("combustibleGas"),QStringLiteral("CombustibleGas"),QStringLiteral("combustible_gas"),QStringLiteral("gas")},
              &data->hasCombustibleGas,&data->combustibleGasDetected);
 
     return matched;
